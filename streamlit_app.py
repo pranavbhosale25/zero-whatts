@@ -1,852 +1,297 @@
-import streamlit as st
+"""Zero Whatts: industrial battery configuration and technoeconomic report."""
+from dataclasses import asdict
+import calendar
+import hashlib
+import json
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+import streamlit as st
+from model import Battery, Tariff, Economics, Scenario, DEFAULT_SCENARIOS, build_load, read_load_csv, run_study
+from ui_help import HELP
+from reporting import SOURCES, REFERENCE_VALUES, METHODOLOGY, summary_table, html_report
 
-# Set page config
-st.set_page_config(
-    page_title="Zero Whatts - Battery Flex Optimizer",
-    page_icon="🔋",
-    layout="wide"
-)
+st.set_page_config(page_title="Zero Whatts | Industrial Storage", page_icon="⚡", layout="wide")
+st.markdown("""<style>
+.block-container{max-width:1320px;padding-top:2rem;padding-bottom:3rem}
+[data-testid="stMetricValue"]{font-size:1.75rem}
+</style>""", unsafe_allow_html=True)
 
-# ============================================================================
-# STATE PRICING DATA (Average hourly prices by state - $/kWh)
-# ============================================================================
+COLORS = {"Conservative": "#94A3B8", "Base": "#FF4B4B", "Aggressive": "#2563EB"}
 
-STATE_PRICING = {
-    "CAISO": {
-        "base_price": 0.22,
-        "hourly_multiplier": [0.6, 0.6, 0.6, 0.6, 0.6, 0.7, 0.9, 1.2, 1.1, 1.0, 0.9, 0.9,
-                             0.9, 0.9, 0.9, 0.9, 1.0, 1.3, 1.8, 1.9, 1.7, 1.4, 1.0, 0.8],
-        "carbon_intensity": 0.23  # kg CO2/kWh
-    },
-    "ERCOT": {
-        "base_price": 0.12,
-        "hourly_multiplier": [0.5, 0.5, 0.5, 0.5, 0.6, 0.8, 1.0, 1.2, 1.1, 1.0, 0.9, 0.9,
-                             0.9, 0.9, 1.0, 1.2, 1.5, 1.8, 2.0, 1.9, 1.6, 1.3, 0.9, 0.7],
-        "carbon_intensity": 0.39
-    },
-    "NYISO": {
-        "base_price": 0.18,
-        "hourly_multiplier": [0.6, 0.6, 0.6, 0.6, 0.7, 0.9, 1.2, 1.4, 1.3, 1.1, 1.0, 0.9,
-                             0.9, 0.9, 1.0, 1.1, 1.3, 1.6, 1.8, 1.7, 1.5, 1.2, 0.9, 0.7],
-        "carbon_intensity": 0.21
-    },
-    "ISO-NE": {
-        "base_price": 0.21,
-        "hourly_multiplier": [0.6, 0.6, 0.6, 0.6, 0.7, 0.9, 1.2, 1.4, 1.3, 1.1, 1.0, 0.9,
-                             0.9, 0.9, 1.0, 1.2, 1.4, 1.7, 1.9, 1.8, 1.5, 1.2, 0.9, 0.7],
-        "carbon_intensity": 0.19
-    },
-    "PJM": {
-        "base_price": 0.13,
-        "hourly_multiplier": [0.7, 0.7, 0.7, 0.7, 0.8, 0.9, 1.0, 1.2, 1.3, 1.4, 1.3, 1.2,
-                             1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.6, 1.3, 1.1, 0.9, 0.8],
-        "carbon_intensity": 0.37
-    },
-    "MISO": {
-        "base_price": 0.11,
-        "hourly_multiplier": [0.6, 0.6, 0.6, 0.6, 0.7, 0.9, 1.1, 1.3, 1.2, 1.0, 0.9, 0.9,
-                             0.9, 0.9, 1.0, 1.2, 1.4, 1.6, 1.7, 1.6, 1.3, 1.1, 0.8, 0.7],
-        "carbon_intensity": 0.32
-    }
-}
 
-# ============================================================================
-# PROFILE GENERATION FUNCTIONS
-# ============================================================================
+def money(value):
+    return f"-${abs(value):,.0f}" if value < 0 else f"${value:,.0f}"
 
-def generate_industrial_load_profile(heat_pump_kw, electrolyzer_kw, ev_fleet_kw):
-    """Generate 24-hour load profile from average power inputs"""
-    hours = 24
-    
-    # Heat pump - higher in morning and evening (heating/cooling peaks)
-    hp_profile = np.zeros(hours)
-    if heat_pump_kw > 0:
-        base_pattern = [0.6, 0.6, 0.6, 0.6, 0.7, 0.9, 1.3, 1.5, 1.4, 1.2, 1.1, 1.0,
-                       1.0, 1.0, 1.0, 1.1, 1.2, 1.4, 1.6, 1.5, 1.3, 1.1, 0.9, 0.7]
-        hp_profile = heat_pump_kw * np.array(base_pattern)
-    
-    # Electrolyzer - runs during day when renewables available
-    elec_profile = np.zeros(hours)
-    if electrolyzer_kw > 0:
-        base_pattern = [0, 0, 0, 0, 0, 0, 0.3, 0.6, 0.9, 1.0, 1.0, 1.0,
-                       1.0, 1.0, 1.0, 1.0, 0.9, 0.6, 0.3, 0, 0, 0, 0, 0]
-        elec_profile = electrolyzer_kw * np.array(base_pattern)
-    
-    # EV fleet - charging in evening/night
-    ev_profile = np.zeros(hours)
-    if ev_fleet_kw > 0:
-        base_pattern = [0.3, 0.2, 0.1, 0.1, 0.1, 0.1, 0.2, 0.3, 0.4, 0.3, 0.2, 0.2,
-                       0.2, 0.2, 0.2, 0.3, 0.5, 0.8, 1.2, 1.5, 1.4, 1.0, 0.7, 0.5]
-        ev_profile = ev_fleet_kw * np.array(base_pattern)
-    
-    total_load = hp_profile + elec_profile + ev_profile
-    
-    return total_load, hp_profile, elec_profile, ev_profile
 
-def get_hourly_prices(state):
-    """Get 24-hour price profile for selected state"""
-    state_data = STATE_PRICING[state]
-    base = state_data["base_price"]
-    multipliers = state_data["hourly_multiplier"]
-    return base * np.array(multipliers)
+def chart_style(fig, title=None, height=360):
+    fig.update_layout(title=title, height=height, template="plotly_white", margin=dict(l=10,r=10,t=45,b=15),
+                      font=dict(family="Arial",color="#31333F"), legend=dict(orientation="h",y=1.12),
+                      paper_bgcolor="rgba(0,0,0,0)", hovermode="x unified")
+    return fig
 
-# ============================================================================
-# BATTERY SIZING AND OPTIMIZATION
-# ============================================================================
 
-def calculate_required_battery_specs(load_profile, peak_reduction_pct, power_to_energy_ratio=0.5):
-    """
-    Calculate required battery capacity and power for peak shaving target
-    
-    Args:
-        load_profile: 24-hour load profile (kW)
-        peak_reduction_pct: Target peak reduction (0.1 for 10%, 0.25 for 25%, etc.)
-        power_to_energy_ratio: Ratio of power to energy (0.5 = 2-hour battery)
-    
-    Returns:
-        dict with required_capacity_kwh, required_power_kw, new_peak_kw
-    """
-    baseline_peak = np.max(load_profile)
-    target_peak = baseline_peak * (1 - peak_reduction_pct)
-    
-    # Calculate energy needed to shave peaks
-    hours_above_target = load_profile > target_peak
-    energy_to_shave = np.sum((load_profile - target_peak) * hours_above_target)
-    
-    # Add safety margin for efficiency losses and operational constraints
-    safety_margin = 1.3
-    required_capacity = energy_to_shave * safety_margin
-    
-    # Power rating based on maximum discharge rate needed
-    max_shaving_power = np.max(load_profile - target_peak)
-    required_power = max_shaving_power * 1.2  # 20% margin
-    
-    # Ensure minimum power-to-energy ratio (e.g., 2-hour battery minimum)
-    min_power = required_capacity * power_to_energy_ratio
-    required_power = max(required_power, min_power)
-    
-    return {
-        'required_capacity_kwh': required_capacity,
-        'required_power_kw': required_power,
-        'new_peak_kw': target_peak,
-        'baseline_peak_kw': baseline_peak,
-        'peak_reduction_kw': baseline_peak - target_peak
-    }
+@st.cache_data(show_spinner=False)
+def calculate(snapshot):
+    return run_study(snapshot['load_kw'], snapshot['monthly_factors'], snapshot['weekend_factor'],
+                     Battery(**snapshot['battery']), Tariff(**snapshot['tariff']), Economics(**snapshot['economics']),
+                     [Scenario(**s) for s in snapshot['scenarios']])
 
-def simulate_battery_operation(load_profile, price_profile, battery_capacity, battery_power,
-                               efficiency, peak_threshold, vpp_enabled=False):
-    """
-    Simulate battery operation for peak shaving and VPP
-    
-    Returns:
-        dict with battery_power, soc, grid_power, costs, vpp_revenue
-    """
-    hours = len(load_profile)
-    battery_schedule = np.zeros(hours)  # Positive = charge, Negative = discharge
-    soc = np.zeros(hours)
-    grid_power = np.zeros(hours)
-    costs = np.zeros(hours)
-    vpp_revenue = np.zeros(hours)
-    
-    current_soc = 0.5  # Start at 50%
-    min_soc = 0.1
-    max_soc = 0.9
-    
-    # Calculate price percentiles for VPP and charging decisions
-    price_p75 = np.percentile(price_profile, 75)
-    price_p25 = np.percentile(price_profile, 25)
-    
-    for hour in range(hours):
-        load = load_profile[hour]
-        price = price_profile[hour]
-        
-        soc[hour] = current_soc
-        
-        # Rule 1: Peak shaving (highest priority)
-        if load > peak_threshold:
-            discharge_needed = min(load - peak_threshold, battery_power)
-            available_energy = (current_soc - min_soc) * battery_capacity
-            actual_discharge = min(discharge_needed, available_energy * efficiency)
-            
-            battery_schedule[hour] = -actual_discharge
-            current_soc -= actual_discharge / (battery_capacity * efficiency)
-            grid_power[hour] = load - actual_discharge
-        
-        # Rule 2: VPP export during high prices
-        elif vpp_enabled and price > price_p75 and current_soc > 0.4:
-            vpp_discharge = min(battery_power * 0.5, (current_soc - 0.3) * battery_capacity * efficiency)
-            battery_schedule[hour] = -vpp_discharge
-            current_soc -= vpp_discharge / (battery_capacity * efficiency)
-            grid_power[hour] = load - vpp_discharge
-            vpp_revenue[hour] = vpp_discharge * price * 0.8  # 80% of retail for export
-        
-        # Rule 3: Charge during low prices
-        elif price < price_p25 and current_soc < max_soc:
-            charge_power = min(battery_power * 0.5, (max_soc - current_soc) * battery_capacity / efficiency)
-            battery_schedule[hour] = charge_power
-            current_soc += charge_power * efficiency / battery_capacity
-            grid_power[hour] = load + charge_power
-        
+
+st.title("⚡️ Zero Whatts")
+st.subheader("Battery Projects Screening for Industrial Loads")
+st.markdown("""Steps to use this tool:
+
+1. **Build your study**
+2. **Configure scenarios**
+3. **View results**
+""")
+
+st.subheader("1. Build your study")
+load_tab, battery_tab, finance_tab, tariff_tab = st.tabs([
+    "Industrial load", "Battery", "Economics", "Utility tariff"])
+
+input_error = None
+with load_tab:
+    st.markdown("#### Operating day")
+    st.caption("Add equipment and its operating hours. Hover over column headings for help.")
+    source = st.radio("Load input", ["Equipment builder", "24-hour CSV"], horizontal=True,help=HELP['Load input'])
+    components = pd.DataFrame([
+        {"Equipment":"Facility baseload", "Rated kW":200., "Load factor":1., "Start hour":0, "End hour":24},
+        {"Equipment":"Process machinery", "Rated kW":1000., "Load factor":0.8, "Start hour":7, "End hour":19},
+        {"Equipment":"HVAC / heat pumps", "Rated kW":500., "Load factor":0.7, "Start hour":6, "End hour":22},
+        {"Equipment":"Fleet charging", "Rated kW":300., "Load factor":0.8, "Start hour":17, "End hour":23}])
+    load = np.zeros(24)
+    equipment = []
+    if source == "Equipment builder":
+        components = st.data_editor(components, num_rows="dynamic", hide_index=True, width="stretch", key="equipment",
+            column_config={"Equipment":st.column_config.TextColumn(help="Name of the machine, process or group of loads. Add one row per operating schedule."), "Rated kW":st.column_config.NumberColumn(min_value=0.,required=True,help="Electrical nameplate power before the load factor is applied. Use the equipment rating or measured operating power; values depend on the site."),
+                           "Load factor":st.column_config.NumberColumn(min_value=0.,max_value=1.,step=0.05,required=True,help="Average fraction of rated power used during operating hours. 0.8 means 80%. Starting example: 0.8 for process machinery, illustrative; use measured data."),
+                           "Start hour":st.column_config.NumberColumn(min_value=0,max_value=23,step=1,required=True,help="First operating hour in 24-hour local time, inclusive. Example: 7 means 07:00. Equal start/end hours mean continuous operation."),
+                           "End hour":st.column_config.NumberColumn(min_value=0,max_value=24,step=1,required=True,help="End of operating window, exclusive. Example: 19 means stop at 19:00; 24 means midnight. An end earlier than the start crosses midnight.")})
+        equipment = components.to_dict('records')
+        try:
+            load = build_load(equipment)
+        except (ValueError, TypeError) as exc:
+            input_error = str(exc)
+    else:
+        st.caption("Columns: hour,load_kw. Exactly 24 hourly average power readings (0–23). Monthly and weekend multipliers below also apply to uploaded data.")
+        example = pd.DataFrame({"hour":np.arange(24),"load_kw":build_load(components.to_dict('records'))})
+        st.download_button("Download CSV template", example.to_csv(index=False), "load_template.csv", "text/csv")
+        uploaded = st.file_uploader("Upload representative weekday", type="csv",help=HELP['Upload representative weekday'])
+        if uploaded:
+            try:
+                load = read_load_csv(uploaded)
+            except (ValueError, TypeError) as exc:
+                input_error = str(exc)
         else:
-            # No battery action
-            grid_power[hour] = load
-        
-        # Calculate costs
-        costs[hour] = grid_power[hour] * price
-        
-        # Ensure SOC stays within bounds
-        current_soc = np.clip(current_soc, min_soc, max_soc)
-    
-    return {
-        'battery_schedule': battery_schedule,
-        'soc': soc,
-        'grid_power': grid_power,
-        'costs': costs,
-        'vpp_revenue': vpp_revenue,
-        'total_throughput': np.sum(np.abs(battery_schedule))
-    }
-
-# ============================================================================
-# FINANCIAL CALCULATIONS
-# ============================================================================
-
-def calculate_annual_metrics(load_profile, price_profile, battery_specs, 
-                            battery_capacity, battery_power, efficiency,
-                            installed_cost_per_kwh, opex_per_kwh_throughput,
-                            demand_charge_rate, vpp_enabled, state,
-                            degradation_rate_annual):
-    """
-    Calculate annual financial and operational metrics
-    """
-    peak_threshold = battery_specs['new_peak_kw']
-    baseline_peak = battery_specs['baseline_peak_kw']
-    
-    # Simulate battery operation
-    results = simulate_battery_operation(
-        load_profile, price_profile, battery_capacity, battery_power,
-        efficiency, peak_threshold, vpp_enabled
-    )
-    
-    # Baseline costs (no battery)
-    baseline_energy_cost = np.sum(load_profile * price_profile)
-    baseline_demand_charge = baseline_peak * demand_charge_rate * 12  # Monthly charge
-    baseline_total_cost = baseline_energy_cost + baseline_demand_charge
-    
-    # Optimized costs (with battery)
-    optimized_energy_cost = np.sum(results['costs'])
-    optimized_peak = np.max(results['grid_power'])
-    optimized_demand_charge = optimized_peak * demand_charge_rate * 12
-    optimized_total_cost = optimized_energy_cost + optimized_demand_charge
-    
-    # Operating expenses
-    annual_throughput = results['total_throughput'] * 365  # Scale to annual
-    opex = annual_throughput * opex_per_kwh_throughput
-    
-    # Savings
-    energy_savings = baseline_energy_cost - optimized_energy_cost
-    demand_charge_savings = baseline_demand_charge - optimized_demand_charge
-    total_savings = energy_savings + demand_charge_savings
-    
-    # VPP revenue (annual)
-    vpp_revenue_daily = np.sum(results['vpp_revenue'])
-    vpp_revenue_annual = vpp_revenue_daily * 365
-    
-    # Demand response revenue (capacity payment + energy payment)
-    # Assuming participation in DR program with 20 events/year, 3 hours each
-    dr_capacity_payment = battery_power * 100  # $100/kW-year
-    dr_energy_events = 20  # events per year
-    dr_hours_per_event = 3
-    dr_energy_payment = battery_power * 0.2 * dr_energy_events * dr_hours_per_event  # $0.50/kWh
-    dr_revenue_annual = dr_capacity_payment + dr_energy_payment
-    
-    # Total annual benefit
-    total_annual_benefit = total_savings + vpp_revenue_annual + dr_revenue_annual - opex
-    
-    # Emissions
-    carbon_intensity = STATE_PRICING[state]['carbon_intensity']
-    grid_energy_avoided = np.sum(load_profile) - np.sum(results['grid_power'])
-    emissions_avoided_kg = grid_energy_avoided * carbon_intensity * 365
-    emissions_avoided_tons = emissions_avoided_kg / 1000
-    
-    # Grid metrics
-    hours_grid_avoided = np.sum(results['grid_power'] < load_profile)
-    
-    # Backup power calculation (full load, 90% to 20% SOC)
-    usable_soc = 0.7  # 90% to 20%
-    average_load = np.mean(load_profile)
-    backup_hours = (battery_capacity * usable_soc) / average_load if average_load > 0 else 0
-    
-    return {
-        'baseline_energy_cost': baseline_energy_cost * 365,
-        'baseline_demand_charge': baseline_demand_charge,
-        'baseline_total_cost': baseline_total_cost * 365,
-        'optimized_energy_cost': optimized_energy_cost * 365,
-        'optimized_demand_charge': optimized_demand_charge,
-        'optimized_total_cost': optimized_total_cost * 365,
-        'energy_savings': energy_savings * 365,
-        'demand_charge_savings': demand_charge_savings,
-        'total_savings': (energy_savings * 365) + demand_charge_savings,
-        'opex': opex,
-        'vpp_revenue': vpp_revenue_annual,
-        'dr_revenue': dr_revenue_annual,
-        'total_annual_benefit': total_annual_benefit,
-        'emissions_avoided_tons': emissions_avoided_tons,
-        'grid_energy_avoided_kwh': grid_energy_avoided * 365,
-        'hours_grid_avoided': hours_grid_avoided,
-        'backup_hours': backup_hours,
-        'battery_schedule': results['battery_schedule'],
-        'soc': results['soc'],
-        'grid_power': results['grid_power'],
-        'baseline_peak': baseline_peak,
-        'optimized_peak': optimized_peak
-    }
-
-def calculate_multi_year_financials(annual_metrics, battery_capacity, installed_cost_per_kwh,
-                                   num_years, tariff_increase_pct, degradation_rate_annual):
-    """
-    Calculate financial metrics over N years with degradation and tariff escalation
-    """
-    capex = battery_capacity * installed_cost_per_kwh
-    
-    yearly_data = []
-    cumulative_benefit = 0
-    remaining_capacity = 1.0  # 100% at start
-    
-    for year in range(1, num_years + 1):
-        # Apply degradation
-        remaining_capacity *= (1 - degradation_rate_annual)
-        capacity_factor = remaining_capacity
-        
-        # Apply tariff escalation
-        escalation_factor = (1 + tariff_increase_pct) ** (year - 1)
-        
-        # Adjust savings and revenues for degradation and escalation
-        year_savings = annual_metrics['total_savings'] * escalation_factor * capacity_factor
-        year_vpp = annual_metrics['vpp_revenue'] * escalation_factor * capacity_factor
-        year_dr = annual_metrics['dr_revenue'] * escalation_factor * capacity_factor
-        year_opex = annual_metrics['opex'] * capacity_factor
-        
-        year_benefit = year_savings + year_vpp + year_dr - year_opex
-        cumulative_benefit += year_benefit
-        
-        yearly_data.append({
-            'year': year,
-            'capacity_remaining': remaining_capacity * 100,
-            'savings': year_savings,
-            'vpp_revenue': year_vpp,
-            'dr_revenue': year_dr,
-            'opex': year_opex,
-            'net_benefit': year_benefit,
-            'cumulative_benefit': cumulative_benefit,
-            'cumulative_with_capex': cumulative_benefit - capex
-        })
-    
-    df = pd.DataFrame(yearly_data)
-    
-    # Calculate payback period
-    payback_year = None
-    for idx, row in df.iterrows():
-        if row['cumulative_with_capex'] >= 0:
-            payback_year = row['year']
-            break
-    
-    total_benefit = df['net_benefit'].sum()
-    npv = total_benefit - capex  # Simplified NPV without discounting
-    
-    return df, capex, total_benefit, npv, payback_year
-
-# ============================================================================
-# STREAMLIT APP
-# ============================================================================
-
-def main():
-    st.title("🔋 Zero Whatts - Battery Peak Shaving Calculator")
-    st.markdown("**Analyze battery storage for industrial decarbonization with peak shaving**")
-    
-    # Sidebar inputs
-    st.sidebar.header("⚙️ Configuration")
-    
-    # Load inputs
-    st.sidebar.subheader("Industrial Loads")
-    heat_pump_kw = st.sidebar.number_input("Heat Pump Average Power (kW)", 0, 5000, 500, 50)
-    electrolyzer_kw = st.sidebar.number_input("Machinery Average Power (kW)", 0, 5000, 800, 50)
-    ev_fleet_kw = st.sidebar.number_input("EV Fleet Average Power (kW)", 0, 2000, 300, 50)
-    
-    # Battery configuration
-    st.sidebar.subheader("Battery System")
-    battery_capacity_options = [250, 500, 1000, 2000, 3000, 5000]
-    battery_capacity = st.sidebar.selectbox(
-        "Battery Capacity (kWh)",
-        battery_capacity_options,
-        index=2
-    )
-    
-    battery_power = st.sidebar.number_input(
-        "Battery Power Rating (kW)",
-        100, 5000, 500, 50,
-        help="Maximum charge/discharge rate"
-    )
-    
-    efficiency = st.sidebar.slider("Round-trip Efficiency (%)", 70, 98, 90) / 100
-    degradation_annual = st.sidebar.slider(
-        "Annual Degradation Rate (%)",
-        0.5, 5.0, 2.0, 0.5,
-        help="Capacity loss per year"
-    ) / 100
-    
-    # Economic inputs
-    st.sidebar.subheader("Economics")
-    installed_cost = st.sidebar.number_input(
-        "Capital Cost ($/kWh)",
-        200, 800, 400, 50,
-        help="Total installed cost per kWh"
-    )
-    
-    opex_rate = st.sidebar.number_input(
-        "O&M Cost ($/kWh-throughput)",
-        0.005, 0.05, 0.015, 0.005,
-        help="Operating cost per kWh cycled"
-    )
-    
-    demand_charge = st.sidebar.number_input(
-        "Demand Charge Rate ($/kW/month)",
-        5.0, 50.0, 15.0, 1.0,
-        help="Monthly peak demand charge"
-    )
-    
-    # Regional settings
-    st.sidebar.subheader("Regional Settings")
-    state = st.sidebar.selectbox(
-        "Transmission Authority",
-        list(STATE_PRICING.keys()),
-        index=0
-    )
-    
-    # Analysis parameters
-    st.sidebar.subheader("Analysis Parameters")
-    num_years = st.sidebar.slider("Analysis Period (years)", 5, 30, 15)
-    tariff_increase = st.sidebar.slider("Annual Tariff Increase (%)", 0.0, 10.0, 3.0, 0.5) / 100
-    
-    # VPP mode
-    # vpp_enabled = st.sidebar.checkbox("Enable VPP Mode", value=False)
-    vpp_enabled = False
-    
-    # Run analysis button
-    if st.sidebar.button("🚀 Calculate", type="primary"):
-        run_analysis(
-            heat_pump_kw, electrolyzer_kw, ev_fleet_kw,
-            battery_capacity, battery_power, efficiency, degradation_annual,
-            installed_cost, opex_rate, demand_charge,
-            state, num_years, tariff_increase, vpp_enabled
-        )
-
-def run_analysis(heat_pump_kw, electrolyzer_kw, ev_fleet_kw,
-                battery_capacity, battery_power, efficiency, degradation_annual,
-                installed_cost, opex_rate, demand_charge,
-                state, num_years, tariff_increase, vpp_enabled):
-    
-    # Generate load profile
-    load_profile, hp_profile, elec_profile, ev_profile = generate_industrial_load_profile(
-        heat_pump_kw, electrolyzer_kw, ev_fleet_kw
-    )
-    
-    # Get price profile
-    price_profile = get_hourly_prices(state)
-    
-    # Calculate three scenarios: 10%, 25%, 50% peak shaving
-    scenarios = [
-        # {'name': '10% Peak Shaving', 'reduction': 0.10},
-        # {'name': '25% Peak Shaving', 'reduction': 0.25},
-        # {'name': '50% Peak Shaving', 'reduction': 0.50}
-        {'name': 'Conservative (10%)', 'reduction': 0.10},
-        {'name': 'Base Case (25%)', 'reduction': 0.25},
-        {'name': 'Aggressive (50%)', 'reduction': 0.50}
-    ]
-    
-    st.header("📊 Peak Shaving Scenarios")
-    
-    scenario_results = []
-    
-    for scenario in scenarios:
-        specs = calculate_required_battery_specs(load_profile, scenario['reduction'])
-        
-        # Check if user's battery is sufficient
-        if battery_capacity >= specs['required_capacity_kwh'] and battery_power >= specs['required_power_kw']:
-            status = "✅ User battery sufficient"
-            use_battery = (battery_capacity, battery_power)
-        else:
-            status = "⚠️ Requires larger battery"
-            use_battery = (specs['required_capacity_kwh'], specs['required_power_kw'])
-        
-        # Calculate annual metrics
-        annual = calculate_annual_metrics(
-            load_profile, price_profile, specs,
-            use_battery[0], use_battery[1], efficiency,
-            installed_cost, opex_rate, demand_charge,
-            vpp_enabled, state, degradation_annual
-        )
-        
-        # Calculate multi-year financials
-        yearly_df, capex, total_benefit, npv, payback = calculate_multi_year_financials(
-            annual, use_battery[0], installed_cost,
-            num_years, tariff_increase, degradation_annual
-        )
-        
-        scenario_results.append({
-            'scenario': scenario['name'],
-            'specs': specs,
-            'status': status,
-            'battery_used': use_battery,
-            'annual': annual,
-            'yearly_df': yearly_df,
-            'capex': capex,
-            'total_benefit': total_benefit,
-            'npv': npv,
-            'payback': payback
-        })
-    
-    # Display comparison table
-    # st.subheader("Scenario Comparison")
-    
-    comparison_data = []
-    for result in scenario_results:
-        comparison_data.append({
-            'Scenario': result['scenario'],
-            'Required Capacity (kWh)': f"{result['specs']['required_capacity_kwh']:.0f}",
-            'Required Power (kW)': f"{result['specs']['required_power_kw']:.0f}",
-            'Status': result['status'],
-            'CapEx ($)': f"${result['capex']:,.0f}",
-            'Annual Savings ($)': f"${result['annual']['total_savings']:,.0f}",
-            'Annual DR Revenue ($)': f"${result['annual']['dr_revenue']:,.0f}",
-            # 'Annual VPP Revenue ($)': f"${result['annual']['vpp_revenue']:,.0f}",
-            f'{num_years}-Year Net Benefit ($)': f"${result['npv']:,.0f}",
-            'Payback (years)': f"{result['payback']:.1f}" if result['payback'] else "N/A"
-        })
-    
-    comparison_df = pd.DataFrame(comparison_data)
-    # st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-    
-    # Detailed analysis for each scenario
-    # st.header("📈 Detailed Analysis by Scenario")
-    
-    tabs = st.tabs([r['scenario'] for r in scenario_results])
-    
-    for tab, result in zip(tabs, scenario_results):
-        with tab:
-            display_scenario_details(result, load_profile, price_profile, state, num_years, efficiency, opex_rate)
-
-def display_scenario_details(result, load_profile, price_profile, state, num_years, efficiency, opex_rate):
-    """Display detailed analysis for a single scenario"""
-    
-    # Key metrics
-    st.subheader("Key Performance Indicators")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(
-            "Peak Reduction",
-            f"{result['specs']['peak_reduction_kw']:.0f} kW",
-            f"{(result['specs']['peak_reduction_kw']/result['specs']['baseline_peak_kw']*100):.1f}%"
-        )
-    
-    with col2:
-        st.metric(
-            "Capital Investment",
-            f"${result['capex']:,.0f}",
-            f"${result['capex']/result['battery_used'][0]:.0f}/kWh"
-        )
-    
-    with col3:
-        st.metric(
-            f"{num_years}-Year Savings",
-            f"${result['total_benefit']:,.0f}",
-            f"NPV: ${result['npv']:,.0f}"
-        )
-    
-    with col4:
-        payback_text = f"{result['payback']:.1f} years" if result['payback'] else "N/A"
-        st.metric(
-            "Payback Period:",
-            payback_text,
-            f"ROI: {(result['npv']/(result['capex']*25)*100):.0f}%" if result['capex'] > 0 else "N/A"
-        )
-    
-    # Annual financial breakdown
-    st.subheader(f"Annual Financial Performance ({num_years} Years)")
-    # Year-by-year table
-    # display_df = result['yearly_df'].copy()
-    # display_df['Year'] = display_df['year']
-    # display_df['Capacity (%)'] = display_df['capacity_remaining'].round(1)
-    # display_df['Energy Savings ($)'] = display_df['savings'].round(0).astype(int)
-    # display_df['DR Revenue ($)'] = display_df['dr_revenue'].round(0).astype(int)
-    # # display_df['VPP Revenue ($)'] = display_df['vpp_revenue'].round(0).astype(int)
-    # display_df['OpEx ($)'] = display_df['opex'].round(0).astype(int)
-    # display_df['Net Benefit ($)'] = display_df['net_benefit'].round(0).astype(int)
-    
-    display_df = result['yearly_df'].copy()
-    display_df['Year'] = display_df['year']
-    display_df['Capacity (%)'] = display_df['capacity_remaining'].round(1)
-    display_df['Energy Savings ($)'] = display_df['savings'].round(0).astype(int).apply(lambda x: f'{x:,}')
-    display_df['DR Revenue ($)'] = display_df['dr_revenue'].round(0).astype(int).apply(lambda x: f'{x:,}')
-    # display_df['VPP Revenue ($)'] = display_df['vpp_revenue'].round(0).astype(int).apply(lambda x: f'{x:,}')
-    display_df['OpEx ($)'] = display_df['opex'].round(0).astype(int).apply(lambda x: f'{x:,}')
-    display_df['Net Benefit ($)'] = display_df['net_benefit'].round(0).astype(int).apply(lambda x: f'{x:,}')
-    
-    st.dataframe(
-        display_df[['Year', 'Capacity (%)', 'Energy Savings ($)', 'DR Revenue ($)', 'OpEx ($)', 'Net Benefit ($)']],
-        hide_index=True,
-        use_container_width=True
-    )
-
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Year-by-year table
-        display_df = result['yearly_df'].copy()
-        display_df['Year'] = display_df['year']
-        display_df['Capacity (%)'] = display_df['capacity_remaining'].round(1)
-        display_df['Energy Savings ($)'] = display_df['savings'].round(0).astype(int)
-        display_df['DR Revenue ($)'] = display_df['dr_revenue'].round(0).astype(int)
-        # display_df['VPP Revenue ($)'] = display_df['vpp_revenue'].round(0).astype(int)
-        display_df['OpEx ($)'] = display_df['opex'].round(0).astype(int)
-        display_df['Net Benefit ($)'] = display_df['net_benefit'].round(0).astype(int)
-        
-        # st.dataframe(
-        #     display_df[['Year', 'Capacity (%)', 'Energy Savings ($)', 'DR Revenue ($)', 'OpEx ($)', 'Net Benefit ($)']],
-        #     hide_index=True,
-        #     use_container_width=True
-        # )
-    
-    # with col2:
-        # Cumulative benefit chart
-        # fig = go.Figure()
-        
-        # fig.add_trace(go.Scatter(
-        #     x=result['yearly_df']['year'],
-        #     y=result['yearly_df']['cumulative_benefit'],
-        #     name='Cumulative Benefit - Nominal',
-        #     line=dict(color='green', width=3),
-        #     fill='tozeroy'
-        # ))
-        
-        # y = result['yearly_df']['cumulative_benefit']
-        # n = len(y)
-        # multipliers = [1 - 0.4 * (i / (n - 1)) for i in range(n)]
-        # scaled_y = [v * m for v, m in zip(y, multipliers)]
-
-        # fig.add_trace(go.Scatter(
-        #     x=result['yearly_df']['year'],
-        #     # y=result['yearly_df']['cumulative_with_capex'],
-        #     y=scaled_y,
-        #     name='Cumulative Benefits - Discounted',
-        #     line=dict(color='blue', width=3, dash='dot')
-        # ))
-        
-        # fig.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Break-even")
-        
-        # fig.update_layout(
-        #     title="Financial Performance",
-        #     xaxis_title="Year",
-        #     yaxis_title="Cumulative Benefit ($)",
-        #     hovermode='x unified',
-        #     height=400
-        # )
-        
-        # st.plotly_chart(fig, use_container_width=True)
-    
-    st.subheader("Cumulative Benefits")
+            input_error = "Upload a 24-hour load CSV before generating the report."
+    weekend_factor = st.slider("Weekend load relative to weekday (%)",0,150,50,5,help=HELP['Weekend load relative to weekday (%)'])/100
+    with st.expander("Seasonality · monthly load multipliers"):
+        season = st.data_editor(pd.DataFrame({"Month":list(calendar.month_abbr)[1:],"Load multiplier":[1.]*12}),
+            hide_index=True,disabled=["Month"],width="stretch",key="seasonality",
+            column_config={"Month":st.column_config.TextColumn(help="Calendar month to which the load multiplier applies."), "Load multiplier":st.column_config.NumberColumn(min_value=0.1,max_value=3.,step=0.05,required=True,help="Scales weekday and weekend demand for this month. Suggested starting value: 1.0 (no seasonality); 1.2 means 20% higher demand.")})
+    factors = season['Load multiplier'].tolist()
+    a,b,c = st.columns(3)
+    a.metric("Typical weekday peak",f"{np.max(load):,.0f} kW")
+    b.metric("Typical weekday energy",f"{np.sum(load):,.0f} kWh")
+    c.metric("Weekday load factor",f"{np.mean(load)/np.max(load)*100 if np.max(load)>0 else 0:.0f}%")
     fig = go.Figure()
-        
-    fig.add_trace(go.Scatter(
-        x=result['yearly_df']['year'],
-        y=result['yearly_df']['cumulative_benefit'],
-        name='Cumulative Benefit - Nominal',
-        line=dict(color='green', width=3),
-        fill='tozeroy'
-    ))
-    
-    y = result['yearly_df']['cumulative_benefit']
-    n = len(y)
-    multipliers = [1 - 0.4 * (i / (n - 1)) for i in range(n)]
-    scaled_y = [v * m for v, m in zip(y, multipliers)]
+    fig.add_scatter(x=np.arange(24),y=load,name="Weekday",fill="tozeroy",line_color="#FF4B4B")
+    fig.add_scatter(x=np.arange(24),y=load*weekend_factor,name="Weekend",line=dict(color="#94a3b8",dash="dot"))
+    fig.update_xaxes(title="Hour of day");fig.update_yaxes(title="Facility demand (kW)")
+    st.plotly_chart(chart_style(fig,height=280),width="stretch",key="load_preview")
 
-    fig.add_trace(go.Scatter(
-        x=result['yearly_df']['year'],
-        # y=result['yearly_df']['cumulative_with_capex'],
-        y=scaled_y,
-        name='Cumulative Benefits - Discounted',
-        line=dict(color='blue', width=3, dash='dot')
-    ))
-    
-    # fig.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Break-even")
-    break_even = result['payback'].round(0).astype(int)
-    fig.add_vline(x=break_even, line_dash="dash", line_color="red", annotation_text="Break-even")
-
-    fig.update_layout(
-        title="Financial Performance",
-        xaxis_title="Year",
-        yaxis_title="Cumulative Benefit ($)",
-        hovermode='x unified',
-        height=400
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # st.plotly_chart(fig, use_container_width=True, key="cum_benefit_chart")
+with battery_tab:
+    st.markdown("#### Battery specifications")
+    st.caption("Use the same nameplate battery in all three scenarios.")
+    a,b,c = st.columns(3)
+    capacity = a.number_input("Nameplate energy (kWh)",100.,1000000.,2000.,100.,help=HELP['Nameplate energy (kWh)'])
+    power = b.number_input("AC inverter power (kW)",25.,100000.,500.,25.,help=HELP['AC inverter power (kW)'])
+    rte = c.number_input("AC round-trip efficiency (%)",50.,100.,85.,1.,help=HELP['AC round-trip efficiency (%)'])/100
+    reserve = st.number_input("Reserve floor (%)",0.,95.,20.,5.,help=HELP['Reserve floor (%)'])/100
+    with st.expander("Advanced battery settings"):
+        a,b = st.columns(2)
+        min_soc = a.number_input("Minimum SOC (%)",0.,95.,10.,5.,help=HELP['Minimum SOC (%)'])/100
+        max_soc = b.number_input("Maximum SOC (%)",5.,100.,90.,5.,help=HELP['Maximum SOC (%)'])/100
+        a,b = st.columns(2)
+        degradation = a.number_input("Annual capacity degradation (%)",0.,10.,2.,0.25,help=HELP['Annual capacity degradation (%)'])/100
+        cycles = b.number_input("Maximum equivalent cycles / day",0.1,4.,1.,0.1,help=HELP['Maximum equivalent cycles / day'])
+    battery = Battery(capacity,power,rte,min_soc,max_soc,reserve,degradation,cycles)
+    a,b,c = st.columns(3)
+    a.metric("Nameplate duration",f"{capacity/power:.1f} h")
+    b.metric("Base dispatchable energy",f"{max(0,max_soc-reserve)*capacity:,.0f} kWh")
+    c.metric("Deliverable at full power",f"{max(0,max_soc-reserve)*capacity*np.sqrt(rte)/power:.1f} h")
 
 
-    # Environmental & Grid Impact
-    st.subheader("Environmental & Grid Impact")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric(
-            "Annual Emissions Avoided",
-            f"{result['annual']['emissions_avoided_tons']:.1f} tons CO₂",
-            f"{result['annual']['emissions_avoided_tons']*num_years:.0f} tons over {num_years}yr"
-        )
-    
-    with col2:
-        st.metric(
-            "Grid Energy Avoided",
-            f"{result['annual']['grid_energy_avoided_kwh']:,.0f} kWh/yr",
-            f"{(result['annual']['grid_energy_avoided_kwh']/8760):.0f} kW avg"
-        )
-    
-    with col3:
-        st.metric(
-            "Backup Power Capability",
-            f"{result['annual']['backup_hours']:.1f} hours",
-            "Full load coverage"
-        )
-    
-    # Daily operation visualization
-    st.subheader("Typical Daily Operation")
-    
-    fig = make_subplots(
-        rows=3, cols=1,
-        subplot_titles=('Load Profile & Grid Power', 'Battery Operation', 'Electricity Pricing'),
-        vertical_spacing=0.1,
-        specs=[[{"secondary_y": False}],
-               [{"secondary_y": True}],
-               [{"secondary_y": False}]]
-    )
-    
-    hours = np.arange(24)
-    
-    # Row 1: Load and grid power
-    fig.add_trace(
-        go.Scatter(x=hours, y=load_profile, name="Total Load",
-                  line=dict(color='royalblue', width=2)),
-        row=1, col=1
-    )
-    
-    fig.add_trace(
-        go.Scatter(x=hours, y=result['annual']['grid_power'], name="Grid Power",
-                  line=dict(color='green', width=2, dash='dot')),
-        row=1, col=1
-    )
-    
-    fig.add_hline(
-        y=result['specs']['new_peak_kw'],
-        line_dash="dash", line_color="red",
-        annotation_text="Peak Target",
-        row=1, col=1
-    )
-    
-    # Row 2: Battery operation
-    fig.add_trace(
-        go.Scatter(x=hours, y=result['annual']['soc']*100, name="State of Charge",
-                  line=dict(color='orange', width=2)),
-        row=2, col=1
-    )
-    
-    colors = ['lightblue' if x >= 0 else 'salmon' for x in result['annual']['battery_schedule']]
-    fig.add_trace(
-        go.Bar(x=hours, y=result['annual']['battery_schedule'], name="Battery Power",
-               marker_color=colors),
-        row=2, col=1, secondary_y=True
-    )
-    
-    # Row 3: Pricing
-    fig.add_trace(
-        go.Scatter(x=hours, y=price_profile, name="Electricity Price",
-                  line=dict(color='purple', width=2), fill='tozeroy'),
-        row=3, col=1
-    )
-    
-    # Update axes
-    fig.update_xaxes(title_text="Hour of Day", row=3, col=1)
-    fig.update_yaxes(title_text="Power (kW)", row=1, col=1)
-    fig.update_yaxes(title_text="SOC (%)", row=2, col=1)
-    fig.update_yaxes(title_text="Power (kW)", row=2, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="Price ($/kWh)", row=3, col=1)
-    
-    fig.update_layout(height=900, showlegend=True, hovermode='x unified')
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Summary statistics
-    st.subheader("Summary Statistics")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("**Financial Summary**")
-        financial_summary = {
-            "Metric": [
-                "Total Capital Investment",
-                f"Total {num_years}-Year Savings",
-                f"Total {num_years}-Year DR Revenue",
-                f"Total {num_years}-Year VPP Revenue",
-                f"Total {num_years}-Year OpEx",
-                f"Net Present Value ({num_years}yr)",
-                "Return on Investment",
-                "Payback Period"
-            ],
-            "Value": [
-                f"${result['capex']:,.0f}",
-                f"${result['yearly_df']['savings'].sum():,.0f}",
-                f"${result['yearly_df']['dr_revenue'].sum():,.0f}",
-                f"${result['yearly_df']['vpp_revenue'].sum():,.0f}",
-                f"${result['yearly_df']['opex'].sum():,.0f}",
-                f"${result['npv']:,.0f}",
-                f"{(result['npv']/result['capex']*100):.1f}%" if result['capex'] > 0 else "N/A",
-                f"{result['payback']:.1f} years" if result['payback'] else ">30 years"
-            ]
-        }
-        st.dataframe(financial_summary, hide_index=True, use_container_width=True)
-    
-    with col2:
-        st.markdown("**Technical Summary**")
-        technical_summary = {
-            "Metric": [
-                "Battery Capacity Used",
-                "Battery Power Rating",
-                "Round-trip Efficiency",
-                "Baseline Peak Demand",
-                "Optimized Peak Demand",
-                "Peak Reduction",
-                "Annual Battery Cycles",
-                f"Capacity After {num_years} Years"
-            ],
-            "Value": [
-                f"{result['battery_used'][0]:,.0f} kWh",
-                f"{result['battery_used'][1]:,.0f} kW",
-                f"{efficiency*100:.0f}%",
-                f"{result['specs']['baseline_peak_kw']:.0f} kW",
-                f"{result['specs']['new_peak_kw']:.0f} kW",
-                f"{result['specs']['peak_reduction_kw']:.0f} kW ({(result['specs']['peak_reduction_kw']/result['specs']['baseline_peak_kw']*100):.1f}%)",
-                f"{(result['annual']['opex']/opex_rate/result['battery_used'][0]):.1f}",
-                f"{result['yearly_df'].iloc[-1]['capacity_remaining']:.1f}%"
-            ]
-        }
-        st.dataframe(technical_summary, hide_index=True, use_container_width=True)
-if __name__ == "__main__":
-    main()
+with finance_tab:
+    st.markdown("#### Project economics")
+    a,b = st.columns(2)
+    installed_cost = a.number_input("Total installed cost ($)",1000.,100000000.,825000.,10000.,help=HELP['Total installed cost ($)'])
+    fixed_om = b.number_input("Fixed O&M ($/kW-year)",0.,1000.,10.,1.,help=HELP['Fixed O&M ($/kW-year)'])
+    a,b = st.columns(2)
+    years = a.number_input("Analysis period (years)",1,30,15,help=HELP['Analysis period (years)'])
+    discount = b.number_input("Nominal discount rate (%)",0.,50.,8.,0.5,help=HELP['Nominal discount rate (%)'])/100
+    with st.expander("Advanced financial settings"):
+        a,b,c = st.columns(3)
+        incentive = a.number_input("Confirmed upfront incentive ($)",0.,100000000.,0.,10000.,help=HELP['Confirmed upfront incentive ($)'])
+        variable_om = b.number_input("Variable O&M ($/AC kWh discharged)",0.,1.,0.005,0.001,format="%.3f",help=HELP['Variable O&M ($/AC kWh discharged)'])
+        om_escalation = c.number_input("Annual O&M escalation (%)",0.,20.,2.,0.5,help=HELP['Annual O&M escalation (%)'])/100
+        a,b,c = st.columns(3)
+        replacement_year = a.number_input("Replacement year (0 = disabled)",0,int(years),0,help=HELP['Replacement year (0 = disabled)'])
+        replacement_fraction = b.number_input("Replacement / gross installed cost (%)",0.,100.,50.,5.,help=HELP['Replacement / gross installed cost (%)'])/100
+        residual = c.number_input("Terminal residual / initial installed cost (%)",0.,100.,0.,5.,help=HELP['Terminal residual / initial installed cost (%)'])/100
+        start_year = st.number_input("First operating calendar year",2000,2100,2027,help=HELP['First operating calendar year'])
+    economics = Economics(energy_cost_per_kwh=0, power_cost_per_kw=0, project_cost=installed_cost,
+                          upfront_incentive=incentive, fixed_om_per_kw_year=fixed_om,
+                          variable_om_per_kwh=variable_om, om_escalation=om_escalation,
+                          discount_rate=discount, years=int(years), start_year=int(start_year),
+                          replacement_year=replacement_year, replacement_fraction=replacement_fraction,
+                          residual_fraction=residual)
+
+with tariff_tab:
+    st.markdown("#### Utility rates")
+    st.caption("Enter your utility rates. The starting values are illustrative.")
+    a,b,c = st.columns(3)
+    offpeak = a.number_input("Off-peak energy ($/kWh)",0.,5.,0.08,0.01,format="%.3f",help=HELP['Off-peak energy ($/kWh)'])
+    peak = b.number_input("Peak energy ($/kWh)",0.,5.,0.20,0.01,format="%.3f",help=HELP['Peak energy ($/kWh)'])
+    demand = c.number_input("Monthly demand charge ($/kW)",0.,200.,15.,1.,help=HELP['Monthly demand charge ($/kW)'])
+    a,b = st.columns(2)
+    peak_start = a.number_input("Peak window start hour",0,23,16,help=HELP['Peak window start hour'])
+    peak_end = b.number_input("Peak window end hour",0,24,21,help=HELP['Peak window end hour'])
+    with st.expander("Advanced tariff settings"):
+        tariff_escalation = st.number_input("Annual tariff escalation (%)",0.,20.,2.5,0.5,help=HELP['Annual tariff escalation (%)'])/100
+        weekend_peak = st.checkbox("Apply peak energy pricing on weekends",False,help=HELP['Apply peak energy pricing on weekends'])
+    tariff = Tariff(offpeak,peak,peak_start,peak_end,demand,weekend_peak,tariff_escalation)
+
+
+st.subheader("2. Configure scenarios")
+st.caption("Multipliers apply to the study inputs above. Hover over column headings for definitions and starting values.")
+scenario_defaults = pd.DataFrame([asdict(s) for s in DEFAULT_SCENARIOS])
+scenario_data = st.data_editor(scenario_defaults[['name','capex_factor','tariff_factor','degradation_factor']],
+    hide_index=True, disabled=["name"], width="stretch", key="scenarios", column_config={
+        "name":st.column_config.TextColumn("Scenario",help="Conservative uses less favorable assumptions, Base uses the study inputs, and Aggressive uses more favorable assumptions. These are sensitivity cases, not probability forecasts."),
+        "capex_factor":st.column_config.NumberColumn("Installed cost ×",min_value=0.1,max_value=3.,step=0.05,required=True,
+            help="Multiplies total installed cost before the fixed upfront incentive. Suggested sensitivity values: Conservative 1.15, Base 1.00, Aggressive 0.90. Illustrative, not market averages."),
+        "tariff_factor":st.column_config.NumberColumn("Utility rates ×",min_value=0.1,max_value=3.,step=0.05,required=True,
+            help="Multiplies energy and demand rates in both baseline and battery bills. Suggested sensitivity values: Conservative 0.85, Base 1.00, Aggressive 1.15. Illustrative, not a price forecast."),
+        "degradation_factor":st.column_config.NumberColumn("Degradation ×",min_value=0.1,max_value=3.,step=0.1,required=True,
+            help="Multiplies annual capacity degradation. Suggested sensitivity values: Conservative 1.25, Base 1.00, Aggressive 0.75. Illustrative; use vendor-supported bounds.")})
+with st.expander("Advanced scenario settings"):
+    technical_defaults = scenario_defaults[['name','dispatch_factor','efficiency_delta']].copy()
+    technical_defaults['efficiency_delta'] *= 100
+    technical_data = st.data_editor(technical_defaults,hide_index=True,disabled=['name'],width="stretch",key="technical_scenarios",column_config={
+        "name":st.column_config.TextColumn("Scenario",help="Technical sensitivity assumptions for the same configured nameplate battery."),
+        "dispatch_factor":st.column_config.NumberColumn("Available energy & power ×",min_value=0.1,max_value=1.,step=0.05,required=True,
+            help="Derates dispatchable energy and power to represent operating headroom, not outage availability. Suggested starting values: Conservative 0.90, Base 1.00, Aggressive 1.00; illustrative."),
+        "efficiency_delta":st.column_config.NumberColumn("Efficiency adjustment (pp)",min_value=-15.,max_value=15.,step=1.,format="%.1f",required=True,
+            help="Adds percentage points to round-trip efficiency; −2 changes 85% to 83%. Suggested sensitivity values: Conservative −2, Base 0, Aggressive +2; illustrative.")})
+scenario_data = scenario_data.merge(technical_data,on='name',validate='one_to_one')
+scenario_data['efficiency_delta'] /= 100
+
+snapshot = dict(currency="USD",model_version="2.0",load_source=source,
+                equipment=equipment,load_kw=load.tolist(),monthly_factors=factors,weekend_factor=weekend_factor,
+                battery=asdict(battery),tariff=asdict(tariff),economics=asdict(economics),scenarios=scenario_data.to_dict('records'))
+fingerprint = hashlib.sha256(json.dumps(snapshot,sort_keys=True).encode()).hexdigest()
+if input_error:
+    st.warning(input_error)
+if st.button("Generate technoeconomic report",type="primary",width="stretch",disabled=bool(input_error)):
+    try:
+        with st.spinner("Optimizing monthly operation and annual cash flows for all three scenarios…"):
+            results = calculate(snapshot)
+        st.session_state['study'] = dict(results=results,snapshot=snapshot,fingerprint=fingerprint)
+    except ValueError as exc:
+        st.error(str(exc))
+
+study = st.session_state.get('study')
+if study:
+    st.divider()
+    if study['fingerprint'] != fingerprint:
+        st.warning("Inputs have changed. The report below shows the last generated study; generate again to update it.")
+    results, saved = study['results'], study['snapshot']
+    st.subheader("3. View results")
+    st.caption(f"United States · USD · {saved['battery']['capacity_kwh']:,.0f} kWh / {saved['battery']['power_kw']:,.0f} kW · {saved['economics']['years']} years · {saved['economics']['discount_rate']:.1%} nominal discount rate")
+    base = next(r for r in results if r['scenario']['name']=='Base')
+    first = base['yearly'].iloc[0]
+    a,b,c,d = st.columns(4)
+    a.metric("Base NPV",money(base['npv']))
+    b.metric("Year 1 bill savings",money(first.energy_savings+first.demand_savings))
+    c.metric("Achieved peak reduction",f"{(1-first.optimized_peak_kw/first.baseline_peak_kw)*100:.1f}%")
+    d.metric("Simple payback",f"{base['payback']:.1f} years" if base['payback'] is not None else "Not reached")
+    if base['npv'] >= 0:
+        st.success("Base-case modeled returns exceed the selected discount rate. Compare the conservative case and validate tariff and load assumptions before committing capital.")
+    else:
+        st.info("Base-case bill savings do not recover investment at the selected discount rate. Explore installed cost, tariff spread, demand charges or battery size.")
+    comparison, operation, cashflow, method = st.tabs(["Scenario comparison","Battery operation","Cash flows","Methodology & inputs"])
+    with comparison:
+        table = summary_table(results)
+        st.dataframe(table,width="stretch",hide_index=True,column_config={
+            k:st.column_config.NumberColumn(format="%.1f" if '%' in k or 'years' in k else "$%.0f") for k in table.columns if k!='Scenario'})
+        st.caption("Blank payback means not reached in the selected horizon. Bill savings exclude O&M; operating net subtracts O&M and excludes replacement / residual cash flows.")
+        a,b = st.columns(2)
+        with a:
+            fig = go.Figure(go.Bar(x=table.Scenario,y=table['NPV ($)'],marker_color=[COLORS[n] for n in table.Scenario]))
+            fig.add_hline(y=0,line_color="#9ca3af");fig.update_yaxes(title="Discounted net value ($)")
+            st.plotly_chart(chart_style(fig,"Investment value by outlook"),width="stretch")
+        with b:
+            fig = go.Figure()
+            for r in results:
+                y=r['yearly']
+                fig.add_scatter(x=[0]+y.year.tolist(),y=[-r['net_capex']]+y.cumulative_discounted.tolist(),name=r['scenario']['name'],line_color=COLORS[r['scenario']['name']])
+            fig.add_hline(y=0,line_color="#9ca3af");fig.update_xaxes(title="Operating year");fig.update_yaxes(title="Cumulative discounted cash ($)")
+            st.plotly_chart(chart_style(fig,"Path to discounted break-even"),width="stretch")
+    with operation:
+        a,b,c=st.columns(3)
+        choice=a.selectbox("Scenario",[r['scenario']['name'] for r in results],index=1,help=HELP['Scenario'])
+        month=b.selectbox("Representative month",list(calendar.month_abbr)[1:],help=HELP['Representative month'])
+        day=c.selectbox("Day type",['Weekday','Weekend'],help=HELP['Day type'])
+        r=next(r for r in results if r['scenario']['name']==choice)
+        data=r['dispatch'];data=data[(data.month==month)&(data.day_type==day)]
+        fig=make_subplots(rows=3,cols=1,shared_xaxes=True,vertical_spacing=.08,subplot_titles=["Facility load and grid import","Battery dispatch (AC)","State of charge / tariff"],specs=[[{}],[{}],[{"secondary_y":True}]])
+        fig.add_scatter(x=data.hour,y=data.load_kw,name="Facility load",line_color="#94a3b8",row=1,col=1)
+        fig.add_scatter(x=data.hour,y=data.grid_kw,name="Grid import",line_color="#FF4B4B",row=1,col=1)
+        fig.add_bar(x=data.hour,y=data.charge_kw,name="Charge",marker_color="#2563eb",row=2,col=1)
+        fig.add_bar(x=data.hour,y=-data.discharge_kw,name="Discharge",marker_color="#FF4B4B",row=2,col=1)
+        fig.add_scatter(x=list(range(25)),y=data.soc_start_pct.tolist()+[data.soc_end_pct.iloc[-1]],name="SOC",line_color="#d97706",row=3,col=1)
+        fig.add_scatter(x=data.hour,y=data.price,name="Energy rate",line=dict(color="#64748b",dash="dot"),row=3,col=1,secondary_y=True)
+        fig.update_yaxes(title_text="kW",row=1,col=1);fig.update_yaxes(title_text="kW",row=2,col=1)
+        fig.update_yaxes(title_text="SOC (%)",row=3,col=1,secondary_y=False);fig.update_yaxes(title_text="$/kWh",row=3,col=1,secondary_y=True)
+        fig.update_xaxes(title_text="Hour boundary / hour of day",row=3,col=1)
+        st.plotly_chart(chart_style(fig,height=680),width="stretch")
+        y=r['yearly'].iloc[0]
+        a,b,c=st.columns(3)
+        a.metric("Year 1 energy losses",f"{y.grid_kwh-y.load_kwh:,.0f} kWh")
+        b.metric("Year 1 equivalent cycles",f"{y.equivalent_cycles:,.0f}")
+        c.metric("Year 1 energy bill saving",money(y.energy_savings))
+        st.caption("Grid charging incurs energy losses; storage does not automatically avoid emissions. Cycles are measured against the available SOC window.")
+        st.dataframe(r['monthly'].round(2),hide_index=True,width="stretch")
+    with cashflow:
+        selected=st.selectbox("Cash flow scenario",[r['scenario']['name'] for r in results],index=1,help=HELP['Cash flow scenario'])
+        r=next(r for r in results if r['scenario']['name']==selected)
+        st.caption(f"Year 0 investment: {money(-r['net_capex'])}. Annual values below are USD; negative cash flow is retained.")
+        columns=['year','capacity_remaining_pct','energy_savings','demand_savings','fixed_om','variable_om','replacement','residual','net_cashflow','discounted_cashflow','cumulative_cashflow','cumulative_discounted']
+        st.dataframe(r['yearly'][columns].round(2),hide_index=True,width="stretch")
+        st.caption("Replacement resets capacity at the start of its selected year. Payback accounts for later cash outflows through the study horizon.")
+    with method:
+        for paragraph in METHODOLOGY.strip().split('\n\n'):
+            st.write(paragraph)
+        st.json(saved,expanded=False)
+    st.markdown("#### Export the report")
+    a,b,c=st.columns(3)
+    a.download_button("Download complete HTML report",html_report(results,saved),"zero_whatts_report.html","text/html",width="stretch")
+    annual=pd.concat([r['yearly'].assign(scenario=r['scenario']['name']) for r in results],ignore_index=True)
+    b.download_button("Download annual cash flows",annual.to_csv(index=False),"zero_whatts_cashflows.csv","text/csv",width="stretch")
+    c.download_button("Download study inputs",json.dumps(saved,indent=2),"zero_whatts_inputs.json","application/json",width="stretch")
+    dispatch=pd.concat([r['dispatch'].assign(scenario=r['scenario']['name']) for r in results],ignore_index=True)
+    st.download_button("Download year-one hourly dispatch",dispatch.to_csv(index=False),"zero_whatts_dispatch.csv","text/csv")
+else:
+    st.subheader("3. View results")
+    st.caption("Generate the report to view results.")
+
+st.divider()
+with st.expander("Sources & references", expanded=False):
+    st.caption("References checked 15 October 2026. Only the 85% efficiency starting point is adopted as a cited numeric benchmark. Other defaults and scenario factors are illustrative, editable screening assumptions.")
+    st.dataframe(pd.DataFrame(REFERENCE_VALUES,columns=['Parameter','Starting value','Basis']),hide_index=True,width="stretch")
+    for topic,value,note,url in SOURCES:
+        st.markdown(f"**{topic} · {value}**  \n{note} [Reference ↗]({url})")

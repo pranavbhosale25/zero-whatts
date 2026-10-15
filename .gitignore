@@ -1,4 +1,5 @@
 .streamlit/secrets.toml
+graphify-out/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
